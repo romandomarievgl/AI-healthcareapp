@@ -38,6 +38,8 @@ three properties the platform needs:
 
 ## Architecture
 
+### Data flow
+
 ```
 MockMedicationFeed ──> MedicationIngestionService ──> DrugFrequencyCounter ──> DrugFrequencyController
    (mocked source)        (validate + forward)        (HyperLogLog state)        (GET top-N / count)
@@ -50,6 +52,74 @@ The reusable core is the `DrugFrequencyCounter` interface — everything else
 feeds it or reads from it. The interface is the seam for future scaling: the
 in-process HyperLogLog implementation can be swapped for a Redis- or
 Kafka-backed one without touching the surrounding code.
+
+### Layered (N-tier) architecture
+
+The same components organized as horizontal tiers. Two ingress paths cross the
+tiers: a **write path** (medication events flowing down from external systems)
+and a **read path** (HTTP clients querying rankings).
+
+```
+                 WRITE PATH (ingest)                READ PATH (query)
+            ┌──────────────────────────┐      ┌────────────────────────┐
+            │  External medication      │      │  HTTP / REST clients    │
+ EXTERNAL   │  systems (HL7 / FHIR,     │      │  (dashboards, services, │
+   TIER     │  pharmacy, file drops)    │      │   curl)                 │
+            │  — mocked by              │      │                         │
+            │    MockMedicationFeed     │      │                         │
+            └────────────┬─────────────┘      └────────────┬───────────┘
+                         │ MedicationEvent                  │ HTTP GET
+                         ▼                                  ▼
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ PRESENTATION TIER            api                                            │
+ │   DrugFrequencyController   ·   PatientCountResponse (DTO)                  │
+ │   GET /api/v1/drugs/top   ·   GET /api/v1/drugs/{drugCode}/patient-count    │
+ └───────────────────────────────────┬───────────────────────────────────────┘
+                         │                                  │
+                         ▼                                  ▼
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ APPLICATION / SERVICE TIER   ingestion · persistence                       │
+ │   MockMedicationFeed (Zipfian generator, @Scheduled)                       │
+ │   MedicationIngestionService (validate + forward)                          │
+ │   SnapshotService (@Scheduled snapshot, startup restore, shutdown flush)   │
+ └───────────────────────────────────┬───────────────────────────────────────┘
+                                      │ record() / topN() / distinctPatients()
+                                      ▼
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ DOMAIN / CORE TIER           counter · medication                          │
+ │   DrugFrequencyCounter (interface)  ◄── the scaling seam                   │
+ │   HyperLogLogDrugFrequencyCounter (one HLL sketch per drug, thread-safe)   │
+ │   MedicationEvent · DrugFrequency · SnapshotSupport · DrugSketchSnapshot   │
+ └───────────────────────────────────┬───────────────────────────────────────┘
+                                      │ export() / restore()  (sketch bytes)
+                                      ▼
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ PERSISTENCE / DATA-ACCESS TIER   persistence                               │
+ │   HllSnapshotRepository (Spring Data JPA)   ·   HllSnapshot (@Entity)      │
+ └───────────────────────────────────┬───────────────────────────────────────┘
+                                      │ JDBC
+                                      ▼
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ INFRASTRUCTURE / DATA STORE                                                │
+ │   H2 database — table hll_snapshot (swap for a persistent DB in prod)      │
+ └───────────────────────────────────────────────────────────────────────────┘
+```
+
+**Reading the tiers:**
+
+| Tier | Packages | Responsibility | Depends on |
+|------|----------|----------------|------------|
+| Presentation | `api` | Expose REST endpoints, validate `limit`, map to DTOs | Domain (via the counter interface) |
+| Application / Service | `ingestion`, `persistence` | Orchestrate: generate/validate/forward events, schedule snapshots and recovery | Domain, Persistence |
+| Domain / Core | `counter`, `medication` | The counting logic and records — pure, framework-light, independently testable | nothing downstream |
+| Persistence / Data-access | `persistence` | Read/write serialized sketches | Infrastructure |
+| Infrastructure | — | The H2 database holding `hll_snapshot` | — |
+
+Dependencies point **downward only** (an upper tier depends on the one below,
+never the reverse). The Domain tier sits at the bottom of the call graph for the
+read/write paths and depends on nothing above it, which is why the
+`DrugFrequencyCounter` interface can be re-implemented (Redis, Kafka) without any
+change rippling up into the API or service tiers.
 
 ### Packages (`com.example.demo`)
 
